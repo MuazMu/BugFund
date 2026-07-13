@@ -26,7 +26,6 @@ import logging
 import re
 from typing import Any, Callable, Literal, TypeVar
 
-import litellm
 from pydantic import BaseModel, ValidationError
 
 from .base import LLMProvider, StructuredOutputError
@@ -207,10 +206,14 @@ class LiteLLMProvider(LLMProvider):
     # LiteLLM calls (with graceful response_format fallback)
     # ------------------------------------------------------------------ #
     def _complete_sync(self, messages: list[dict[str, Any]], temperature: float) -> str:
+        import litellm  # lazy: keeps the gateway importable without the SDK installed
+
         params, response_format = self._call_params(messages, temperature)
         return self._extract_content(self._invoke(litellm.completion, params, response_format))
 
     async def _complete_async(self, messages: list[dict[str, Any]], temperature: float) -> str:
+        import litellm  # lazy
+
         params, response_format = self._call_params(messages, temperature)
         return self._extract_content(
             await self._invoke_async(litellm.acompletion, params, response_format)
