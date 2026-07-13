@@ -1,0 +1,27 @@
+[project]
+name = "bugfund-crs"
+version = "0.1.0"
+description = "BugFund — autonomous vulnerability discovery (CRS) orchestration platform."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "sqlalchemy>=2",
+  "asyncpg",
+  "celery",
+  "redis",
+  "langgraph",
+  "litellm",
+  "docker",
+  "pydantic>=2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]

@@ -102,7 +102,7 @@ def generate_structured_response(
         system_prompt=system_prompt,
         retries=retries,
         context=context,
-        temperature=temperature if temperature is not None else active.default_temperature,  # type: ignore[attr-defined]
+        temperature=temperature,
     )
 
 
@@ -124,5 +124,5 @@ async def generate_structured_response_async(
         system_prompt=system_prompt,
         retries=retries,
         context=context,
-        temperature=temperature if temperature is not None else active.default_temperature,  # type: ignore[attr-defined]
+        temperature=temperature,
     )
