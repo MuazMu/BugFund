@@ -259,3 +259,39 @@ control_plane  ──▶  agent_swarm  ──▶  execution_engine
 - `agent_swarm` depends on `execution_engine` (via `sandbox_tool`) and `ai_gateway` only.
 - `control_plane` depends on `agent_swarm` (to compile the graph) and its own DB/queue.
 - No layer reaches *up*: the execution engine never imports swarm or control-plane code.
+
+---
+
+### Implementation notes (actual layout)
+
+The tree above is the target architecture. What is committed today, and where it
+diverges:
+
+- **control_plane — fully split per spec.** `core/{config,logging,security,exceptions}`,
+  `db/{base, models/{tenant,target,campaign,task,finding,agent_run}}` (+ Alembic
+  scaffold under `migrations/`), `orchestrator/{graph,state,budget,runner,checkpoints}`,
+  `tasks/{celery_app,campaigns,sandbox_jobs}`, `api/{main,deps,v1/…,middleware/…}`.
+  The legacy consolidated entrypoints (`core/config.py`, `orchestrator/graph.py`,
+  `tasks/celery_app.py`, the `db/models` package `__init__`) **re-export** their
+  split symbols, so pre-split imports and the test suite keep working.
+- **agent_swarm — kept flat by design.** `nodes.py`, `prompts.py`, `skills.py`,
+  `state.py` remain cohesive single modules rather than `nodes/ skills/ prompts/`
+  subpackages: they are tightly coupled and fully tested, and fragmenting them
+  added risk without value. New packages were added: `memory/{short_term,long_term}`
+  (working-memory views + cross-campaign RAG) and `routing/{edges,policies}`
+  (conditional edges + termination/re-prioritization rules). Four new deterministic
+  skills live in `skills.py`: `cwe_knowledge`, `disasm`, `fuzzer_bridge`,
+  `craft_pov_inputs`.
+- **execution_engine — completed.** `sandbox/{manager,pool,runner,teardown}`,
+  `isolation/{seccomp.json,apparmor.profile,network_policy.py}`,
+  `collectors/{logs,traces,crash}`, `images/{base,harness,targets}`,
+  `api/{server,schemas}` (internal-only).
+- **ai_gateway — extended.** `router.py` (per-role routing + fallbacks),
+  `budget_guard.py` (token/USD caps), `proxy.py` (unified completion/embedding),
+  `config/providers.yaml`.
+- **observability — implemented.** `tracing.py`, `metrics.py`, `langfuse.py`; each
+  degrades to a no-op when its dependency/endpoint is absent.
+- **Root / dev.** `alembic.ini`, `.env.example` (vars are `APP_`-prefixed to match
+  `Settings`), `docker-compose.yml`, `Makefile`, `LICENSE`, `scripts/{seed_demo,run_dev}`.
+- **Tests.** `tests/test_{runtime,control_plane,execution_engine,gateway_observability,swarm_additions}.py`
+  (54 offline tests; no Docker/LLM/Postgres required).

@@ -1,9 +1,9 @@
 """LangGraph node functions for the BugFund swarm.
 
 Each node is an async function ``async def X_node(state: HuntState) -> dict``
-returning a partial state delta that LangGraph merges. Routing is driven by the
-Supervisor and by loop nodes themselves: the active route is read by
-``route_from_state`` (the conditional edge ``graph.py`` wires up).
+returning a partial state delta that LangGraph merges. Each node sets
+``state["route"]``; the compiled graph wires a conditional edge on
+``route_from_state`` (see ``control_plane/orchestrator/graph.py``).
 
 Control-flow summary:
 
@@ -13,8 +13,9 @@ Control-flow summary:
     critic  -> actor (rejected) | patcher (verified, source target) | end
     patcher -> actor (next hypothesis) | end
 
-All LLM calls go through ``ai_gateway.generate_structured_response_async`` so
-each response is JSON-Schema-validated and auto-retried on plain-text output.
+The Actor enforces the step budget so the actor<->critic refinement loop can
+never spin unbounded. All LLM calls go through ``ai_gateway`` so each response
+is JSON-Schema-validated and auto-retried on plain-text output.
 """
 from __future__ import annotations
 
@@ -232,7 +233,12 @@ async def threat_modeler_node(state: HuntState) -> dict[str, Any]:
     """Ingest codebase + SAST + targeted call-site snippets; emit the threat model."""
     target_path = state.get("target_path", "")
     codebase = await read_codebase(target_path)
-    sast = await run_sast_scanner(target_path, rule_type="security")
+    try:
+        sast = await run_sast_scanner(target_path, rule_type="security")
+    except ToolError:
+        # SAST is best-effort: a missing scanner must not abort the campaign.
+        sast = {"scanner": "semgrep", "rule_set": "security", "returncode": -1,
+                "findings": [], "raw": {}}
 
     # Bounded AST-research round: pick symbols, pull just their call-sites.
     references: dict[str, Any] = {}
@@ -265,6 +271,7 @@ async def threat_modeler_node(state: HuntState) -> dict[str, Any]:
     hypotheses = [h.model_dump(mode="json") for h in model.hypotheses]
     first = hypotheses[0]["id"] if hypotheses else None
     return {
+        "route": Route.ACTOR,
         "threat_model": {
             "business_logic": model.business_logic,
             "permission_matrix": model.permission_matrix,
@@ -308,6 +315,12 @@ def _threat_modeler_prompt(
 # --------------------------------------------------------------------------- #
 async def actor_node(state: HuntState) -> dict[str, Any]:
     """Write a PoV for the current hypothesis and run it in the sandbox."""
+    if _budget_exhausted(state):
+        return {
+            "route": Route.END,
+            "status": "completed",
+            "transcript": [{"node": "actor", "next": Route.END.value, "rationale": "budget exhausted"}],
+        }
     hypothesis = _current_hypothesis(state)
     if hypothesis is None:
         return {"route": Route.END, "transcript": [{"node": "actor", "note": "no open hypothesis"}]}
@@ -329,6 +342,7 @@ async def actor_node(state: HuntState) -> dict[str, Any]:
     )
 
     return {
+        "route": Route.CRITIC,
         "pending_pov": plan.pov_script,
         "pending_expected_signal": plan.expected_signal,
         "last_result": result,

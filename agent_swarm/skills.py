@@ -47,6 +47,11 @@ __all__ = [
     "find_function_references",
     "apply_source_patch",
     "execute_sandbox_script",
+    "cwe_knowledge",
+    "disasm",
+    "fuzzer_bridge",
+    "parse_fuzzer_stats",
+    "craft_pov_inputs",
     "TOOL_REGISTRY",
     "tool_schemas",
 ]
@@ -681,6 +686,256 @@ async def execute_sandbox_script(
 
 
 # --------------------------------------------------------------------------- #
+# Tool 7 — cwe_knowledge (CWE/CVSS lookup & mapping)
+# --------------------------------------------------------------------------- #
+_CWE_DB: dict[str, tuple[str, str, str]] = {
+    "CWE-22": ("Path Traversal", "Improper limitation of a pathname to a restricted directory.", "Canonicalize/validate paths against an allowlist root."),
+    "CWE-78": ("OS Command Injection", "Constructing an OS command from externally-influenced input.", "Avoid shell; use argument arrays + strict input validation."),
+    "CWE-79": ("Cross-site Scripting", "Improper neutralization of user input in generated output.", "Contextual output encoding; CSP."),
+    "CWE-89": ("SQL Injection", "Improper neutralization of special elements in an SQL command.", "Parameterized queries / prepared statements."),
+    "CWE-121": ("Stack-based Buffer Overflow", "Writing past the end of a stack buffer.", "Bounds-checked APIs; stack canaries/fortify; memory-safe languages."),
+    "CWE-190": ("Integer Overflow/Wraparound", "Arithmetic that overflows the result's type.", "Checked/bignum arithmetic; validate ranges."),
+    "CWE-287": ("Improper Authentication", "A claim of identity is not correctly validated.", "Strong, well-tested authn; MFA; secure session handling."),
+    "CWE-416": ("Use After Free", "Memory referenced after it was freed.", "Ownership discipline; static analysis; ASan."),
+    "CWE-787": ("Out-of-bounds Write", "Writing outside the bounds of an allocated buffer.", "Bounds checks; safe container APIs; fuzzing."),
+    "CWE-862": ("Missing Authorization", "An action is not checked for authorization.", "Enforce authorization on every protected resource/action."),
+}
+
+
+def _normalize_cwe(cwe_id: str) -> str:
+    digits = re.sub(r"[^0-9]", "", cwe_id or "")
+    return f"CWE-{digits}" if digits else (cwe_id or "").upper()
+
+
+async def cwe_knowledge(cwe_id: str) -> dict[str, Any]:
+    """Look up a CWE's name, description, and a mitigation pointer.
+
+    Args:
+        cwe_id: A CWE identifier in any common form (``"CWE-89"``, ``"89"``,
+            ``"cwe89"``).
+
+    Returns:
+        ``{"cwe", "known", "name", "description", "mitigation"}``. ``known`` is
+        ``False`` and the descriptive fields empty when the id is not in the
+        built-in table (the agent should then fall back to its own knowledge).
+    """
+    norm = _normalize_cwe(cwe_id)
+    entry = _CWE_DB.get(norm)
+    if not entry:
+        return {"cwe": norm, "known": False, "name": "", "description": "", "mitigation": ""}
+    name, desc, mitigation = entry
+    return {"cwe": norm, "known": True, "name": name, "description": desc, "mitigation": mitigation}
+
+
+# --------------------------------------------------------------------------- #
+# Tool 8 — disasm (binary disassembly / symbol extraction)
+# --------------------------------------------------------------------------- #
+async def disasm(
+    binary_path: str,
+    *,
+    symbols_only: bool = False,
+    extra_args: Optional[list[str]] = None,
+    timeout_s: int = 120,
+) -> dict[str, Any]:
+    """Disassemble a binary (``objdump``) or list symbols (``nm``).
+
+    Args:
+        binary_path: Path to an ELF/Mach-O/PE binary.
+        symbols_only: If True, list symbols via ``nm`` instead of full disassembly.
+        extra_args: Extra args forwarded to the tool.
+        timeout_s: Hard timeout.
+
+    Returns:
+        ``{binary, tool, returncode, symbols, output}``.
+
+    Raises:
+        ToolError: if the target is missing or the disassembly tool is absent.
+    """
+    target = Path(binary_path)
+    if not target.is_file():
+        raise ToolError(f"disasm: not a file: {target}")
+
+    tool = "nm" if symbols_only else "objdump"
+    cmd = [tool, *(extra_args or []), str(target)]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+    except FileNotFoundError as exc:
+        raise ToolError(f"disasm: '{tool}' not found on PATH") from exc
+
+    try:
+        stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise ToolError(f"disasm: timed out after {timeout_s}s")
+
+    text = stdout_b.decode("utf-8", "replace")
+    # `nm` lines: "<addr> <type> <name>"; objdump we leave as raw text.
+    symbols = []
+    if symbols_only:
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                symbols.append({"address": parts[0], "type": parts[1], "name": " ".join(parts[2:])})
+    return {
+        "binary": str(target),
+        "tool": tool,
+        "returncode": proc.returncode if proc.returncode is not None else -1,
+        "symbols": symbols,
+        "output": text,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Tool 9 — fuzzer_bridge (AFL/libFuzzer job builder + stats parser)
+# --------------------------------------------------------------------------- #
+def _build_fuzz_command(
+    engine: str, target_path: str, harness: Optional[str], duration_s: int, seeds: Optional[str]
+) -> list[str]:
+    if engine == "libfuzzer":
+        cmd = ["./harness", f"-max_total_time={duration_s}"]
+        if seeds:
+            cmd += [seeds]
+        return cmd
+    if engine == "afl":
+        cmd = ["afl-fuzz", f"-t{duration_s * 1000}", "-i", seeds or "/dev/null", "-o", "/tmp/out"]
+        cmd += ["--", target_path, "@@"]
+        return cmd
+    raise ToolError(f"fuzzer_bridge: unknown engine {engine!r} (use 'libfuzzer' or 'afl')")
+
+
+def parse_fuzzer_stats(text: str) -> dict[str, Any]:
+    """Parse libFuzzer/AFL status lines into a structured stats dict."""
+    stats: dict[str, Any] = {"coverage_edges": None, "feature_edges": None,
+                             "corpus_size": None, "execs_per_sec": None, "crashes": None}
+    for line in text.splitlines():
+        line = line.strip()
+        m = re.search(r"#(\d+)\s+INITED", line) or re.search(r"#(\d+)\s+DONE", line)
+        if m and stats["corpus_size"] is None:
+            stats["corpus_size"] = int(m.group(1))
+        for key, pat in (
+            ("coverage_edges", r"cov:\s*(\d+)"),
+            ("feature_edges", r"ft:\s*(\d+)"),
+            ("corpus_size", r"corp:\s*(\d+)"),
+            ("execs_per_sec", r"exec\s*speed:\s*([\d.]+)"),
+            ("crashes", r"crashes:\s*(\d+)"),
+        ):
+            mm = re.search(pat, line)
+            if mm and stats[key] is None:
+                try:
+                    stats[key] = int(float(mm.group(1)))
+                except ValueError:
+                    pass
+    return stats
+
+
+async def fuzzer_bridge(
+    target_path: str,
+    *,
+    engine: str = "libfuzzer",
+    harness: Optional[str] = None,
+    duration_s: int = 30,
+    seeds: Optional[str] = None,
+    extra_args: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Build a fuzz job descriptor for the execution engine (does not execute).
+
+    Fuzzing runs inside a hardened sandbox image (see ``execution_engine/images``);
+    this skill constructs the command the Actor submits via
+    :func:`execute_sandbox_script` and provides a stats parser for the output.
+
+    Args:
+        target_path: The fuzz target / binary path.
+        engine: ``"libfuzzer"`` or ``"afl"``.
+        harness: Compiled harness binary (libFuzzer) or target program (AFL).
+        duration_s: Run duration in seconds.
+        seeds: Seed corpus directory.
+
+    Returns:
+        ``{engine, target, harness, duration_s, command, note}``.
+    """
+    if not target_path:
+        raise ToolError("fuzzer_bridge: target_path is required")
+    cmd = _build_fuzz_command(engine, target_path, harness, duration_s, seeds)
+    cmd += list(extra_args or [])
+    return {
+        "engine": engine,
+        "target": target_path,
+        "harness": harness,
+        "duration_s": duration_s,
+        "command": cmd,
+        "note": "Submit via execute_sandbox_script against a fuzzing harness image; "
+        "parse output with parse_fuzzer_stats.",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Tool 10 — craft_pov_inputs (deterministic PoV input mutation)
+# --------------------------------------------------------------------------- #
+_BOUNDARY_VALUES = ["", "\x00", "\xff", "0", "-1", "2147483647", "-2147483648",
+                    "A" * 4096, "%s%s%s%n%n%n", "../../../etc/passwd", "'" * 64]
+
+
+def _format_aware_mutations(seed: str) -> list[str]:
+    s = seed.strip()
+    if s.startswith("{") or s.startswith("["):
+        # JSON-ish: drop a trailing brace, duplicate a key, overflow a length.
+        return [s[:-1] if s.endswith("}") else s + "}", s.replace(":", "::", 1), s + "\x00"]
+    if "," in s and "\n" not in s:
+        # CSV-ish: inject a delimiter bomb / empty fields.
+        return ["," * 32, s + ",," , s.replace(",", ";")]
+    return []
+
+
+async def craft_pov_inputs(
+    seed: str, *, count: int = 16, max_len: int = 4096
+) -> list[str]:
+    """Deterministically mutate ``seed`` into ``count`` candidate PoV inputs.
+
+    Produces boundary values, bit/byte flips, repetitions, and format-aware
+    breaks (JSON/CSV). Pure and deterministic given the same seed — useful for
+    seeding the Actor's PoV search and for regression suites.
+
+    Args:
+        seed: The canonical input to mutate.
+        count: Maximum number of variants to return.
+        max_len: Hard cap on each variant's length.
+
+    Returns:
+        A list of mutated input strings (deduplicated, capped at ``count``).
+    """
+    if seed is None:
+        seed = ""
+    variants: list[str] = []
+    variants.extend(_BOUNDARY_VALUES)
+    variants.extend(_format_aware_mutations(seed))
+
+    # Bit/byte flips and repetition off the seed itself.
+    b = seed.encode("utf-8", "replace") or b"\x00"
+    for i in range(0, min(len(b), 8)):
+        mut = bytearray(b)
+        mut[i % len(mut)] ^= 0xFF
+        variants.append(bytes(mut).decode("utf-8", "replace"))
+    variants.append(seed * 8)              # repetition
+    variants.append(seed[::-1])            # reversal
+    variants.append(seed + "\x00" * 16)    # null padding
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in variants:
+        v = v[:max_len]
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+        if len(out) >= count:
+            break
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Registry / schema advertisement (for future LLM tool-binding)
 # --------------------------------------------------------------------------- #
 TOOL_REGISTRY = {
@@ -690,6 +945,10 @@ TOOL_REGISTRY = {
     "find_function_references": find_function_references,
     "apply_source_patch": apply_source_patch,
     "execute_sandbox_script": execute_sandbox_script,
+    "cwe_knowledge": cwe_knowledge,
+    "disasm": disasm,
+    "fuzzer_bridge": fuzzer_bridge,
+    "craft_pov_inputs": craft_pov_inputs,
 }
 
 
@@ -719,5 +978,21 @@ def tool_schemas() -> dict[str, dict[str, Any]]:
         "execute_sandbox_script": {
             "description": execute_sandbox_script.__doc__.splitlines()[0].strip(),
             "parameters": {"script_code": "string", "env_vars": "object"},
+        },
+        "cwe_knowledge": {
+            "description": cwe_knowledge.__doc__.splitlines()[0].strip(),
+            "parameters": {"cwe_id": "string"},
+        },
+        "disasm": {
+            "description": disasm.__doc__.splitlines()[0].strip(),
+            "parameters": {"binary_path": "string", "symbols_only": "boolean"},
+        },
+        "fuzzer_bridge": {
+            "description": fuzzer_bridge.__doc__.splitlines()[0].strip(),
+            "parameters": {"target_path": "string", "engine": "string"},
+        },
+        "craft_pov_inputs": {
+            "description": craft_pov_inputs.__doc__.splitlines()[0].strip(),
+            "parameters": {"seed": "string", "count": "int"},
         },
     }

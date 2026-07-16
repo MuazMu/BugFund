@@ -20,7 +20,9 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 
 from .base import GatewayError, LLMProvider, StructuredOutputError
+from .budget_guard import PRICING, BudgetGuard, estimate_cost
 from .litellm_provider import LiteLLMProvider
+from .router import DEFAULT_CONFIG_PATH, ModelRouter, RouterError, load_routing_config
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,14 @@ __all__ = [
     "configure",
     "generate_structured_response",
     "generate_structured_response_async",
+    # routing + budget
+    "ModelRouter",
+    "RouterError",
+    "load_routing_config",
+    "DEFAULT_CONFIG_PATH",
+    "BudgetGuard",
+    "estimate_cost",
+    "PRICING",
 ]
 
 

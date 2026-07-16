@@ -1,0 +1,86 @@
+# BugFund CRS — full-stack dev / single-host deploy.
+#
+# Services: postgres, redis, api, worker, beat.
+# The worker mounts the Docker socket READ-ONLY so it can manage the sandbox
+# pool. SECURITY IMPLICATION: a read-only Docker socket mount still permits
+# container-creation RPCs (Docker does not enforce read-only semantics on
+# socket RPCs the way a filesystem would). Only the worker reaches this socket,
+# and only the hardened container profile is used. See
+# docs/threat_model.md#t7-docker-socket-exposure. For production, prefer a
+# dedicated sandbox node or a policy-enforcing socket proxy.
+
+# YAML anchor: shared build + env configuration for the Python services.
+x-base: &base
+  build: .
+  env_file: .env
+  restart: unless-stopped
+  tty: true
+
+services:
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bugfund
+      POSTGRES_PASSWORD: bugfund
+      POSTGRES_DB: bugfund
+    ports:
+      - "5432:5432"
+    volumes:
+      - bugfund-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bugfund -d bugfund"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    <<: *base
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: uvicorn control_plane.api.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    <<: *base
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # The worker runs campaigns + sandbox lifecycle jobs and drives the sandbox
+    # pool via the Docker SDK.
+    command: celery -A control_plane.tasks.celery_app worker -l info -Q campaigns,sandbox
+    volumes:
+      # Read-only Docker socket mount for sandbox container management.
+      # See the security note at the top of this file.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Read-only access to ingested target artifacts (bind-mounted into sandboxes).
+      - ${APP_TARGETS_ROOT:-/var/lib/bugfund/targets}:${APP_TARGETS_ROOT:-/var/lib/bugfund/targets}:ro
+
+  beat:
+    <<: *base
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Beat schedules periodic jobs: orphan sandbox reaper, budget sweeps,
+    # checkpoint GC.
+    command: celery -A control_plane.tasks.celery_app beat -l info
+
+volumes:
+  bugfund-pgdata:

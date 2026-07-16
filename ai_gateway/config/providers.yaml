@@ -1,0 +1,37 @@
+# Per-role model routing + fallback chains for the BugFund AI gateway.
+#
+# `roles` maps an agent role to its primary model. `fallbacks` defines the
+# ordered chain tried when the primary is unavailable (rate limit, outage).
+# `default` is used for any role not listed. Models are LiteLLM model strings,
+# so provider routing/keys are handled by LiteLLM (ANTHROPIC_API_KEY,
+# OPENAI_API_KEY, ...).
+
+default:
+  model: claude-3-5-sonnet
+
+roles:
+  supervisor:        # routing hub — fast and cheap
+    model: claude-3-5-haiku
+  threat_modeler:
+    model: claude-3-5-sonnet
+  actor:
+    model: claude-3-5-sonnet
+  critic:            # precision gate — strongest reasoning
+    model: claude-3-5-sonnet
+  patcher:
+    model: claude-3-5-sonnet
+  reporter:
+    model: claude-3-5-haiku
+
+fallbacks:
+  claude-3-5-sonnet:
+    - gpt-4o
+    - claude-3-5-haiku
+  claude-3-5-haiku:
+    - gpt-4o-mini
+    - claude-3-5-sonnet
+  gpt-4o:
+    - claude-3-5-sonnet
+    - gpt-4o-mini
+  gpt-4o-mini:
+    - claude-3-5-haiku
